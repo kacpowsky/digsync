@@ -23,8 +23,12 @@ RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuse
 
 WORKDIR /app
 
+RUN mkdir -p /app/.config /app/.cache && chown -R appuser:appuser /app
+
 COPY --from=builder /install /usr/local
 COPY src/ ./src/
+
+ENV HOME=/app
 
 USER appuser
 
