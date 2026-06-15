@@ -8,7 +8,8 @@ Supports two auth strategies:
 import logging
 import re
 import subprocess
-from typing import Optional
+from enum import Enum
+from typing import NamedTuple, Optional
 
 from src.config import AppConfig, ArgoDeploymentTarget
 
@@ -23,6 +24,30 @@ _TOKEN_EXPIRED_INDICATORS = (
     "Unauthenticated",
 )
 
+# Indicators that the application simply does not exist in ArgoCD.
+# This is NOT an error: in dev, services are frequently disabled / not deployed,
+# and we don't want missing apps to flip scrape_success to a failure state.
+_APP_NOT_FOUND_INDICATORS = (
+    "code = NotFound",
+    "not found",
+    "does not exist",
+)
+
+
+class DigestStatus(Enum):
+    """Outcome of fetching a running digest from ArgoCD."""
+
+    FOUND = "found"  # digest successfully extracted
+    NOT_DEPLOYED = "not_deployed"  # app/service is disabled or absent (NOT an error)
+    ERROR = "error"  # real failure (auth, timeout, CLI missing, etc.)
+
+
+class DigestResult(NamedTuple):
+    """Result of a digest lookup, distinguishing 'disabled' from real errors."""
+
+    status: DigestStatus
+    digest: Optional[str] = None
+
 
 class ArgoCDClient:
     """Client for interacting with ArgoCD CLI to get running image digests."""
@@ -34,6 +59,15 @@ class ArgoCDClient:
     def _is_token_expired_error(self, stderr: str) -> bool:
         """Detect whether a CLI error indicates an expired or invalid session."""
         return any(indicator in stderr for indicator in _TOKEN_EXPIRED_INDICATORS)
+
+    def _is_app_not_found_error(self, stderr: str) -> bool:
+        """Detect whether a CLI error means the app is simply not deployed.
+
+        In dev, services are routinely disabled. A missing ArgoCD application is
+        an expected, non-error state - not a scrape failure.
+        """
+        lowered = stderr.lower()
+        return any(indicator.lower() in lowered for indicator in _APP_NOT_FOUND_INDICATORS)
 
     def _login(self) -> bool:
         """Perform ArgoCD login via CLI."""
@@ -84,16 +118,21 @@ class ArgoCDClient:
             return True
         return self._login()
 
-    def get_running_digest(self, target: ArgoDeploymentTarget) -> Optional[str]:
+    def get_running_digest(self, target: ArgoDeploymentTarget) -> DigestResult:
         """Get the currently running image digest for an ArgoCD application.
 
         Runs: argocd app manifests <app_name> [--grpc-web]
         Then extracts the digest from lines matching the image_pattern.
 
+        Returns a DigestResult distinguishing three cases:
+          - FOUND: digest extracted successfully
+          - NOT_DEPLOYED: app missing or image not present (service disabled) - NOT an error
+          - ERROR: real failure (auth, timeout, CLI missing, etc.)
+
         If the session has expired, automatically re-authenticates and retries once.
         """
         if not self._ensure_logged_in():
-            return None
+            return DigestResult(DigestStatus.ERROR)
 
         cmd = ["argocd", "app", "manifests", target.app_name]
         if self._config.argocd_grpc_web:
@@ -109,6 +148,13 @@ class ArgoCDClient:
             if result.returncode != 0:
                 stderr = result.stderr.strip()
 
+                if self._is_app_not_found_error(stderr):
+                    logger.info(
+                        "ArgoCD app %s not found - treating as disabled/not deployed (not an error)",
+                        target.app_name,
+                    )
+                    return DigestResult(DigestStatus.NOT_DEPLOYED)
+
                 if self._is_token_expired_error(stderr):
                     logger.warning(
                         "Session expired while fetching manifests for %s, re-authenticating",
@@ -116,7 +162,7 @@ class ArgoCDClient:
                     )
                     self._invalidate_session()
                     if not self._login():
-                        return None
+                        return DigestResult(DigestStatus.ERROR)
                     return self._fetch_manifests(target)
 
                 logger.error(
@@ -124,18 +170,18 @@ class ArgoCDClient:
                     target.app_name,
                     stderr,
                 )
-                return None
+                return DigestResult(DigestStatus.ERROR)
 
             return self._parse_digest(target, result.stdout)
 
         except subprocess.TimeoutExpired:
             logger.error("ArgoCD manifests command timed out for %s", target.app_name)
-            return None
+            return DigestResult(DigestStatus.ERROR)
         except FileNotFoundError:
             logger.error("ArgoCD CLI not found")
-            return None
+            return DigestResult(DigestStatus.ERROR)
 
-    def _fetch_manifests(self, target: ArgoDeploymentTarget) -> Optional[str]:
+    def _fetch_manifests(self, target: ArgoDeploymentTarget) -> DigestResult:
         """Fetch manifests without retry (used after re-authentication)."""
         cmd = ["argocd", "app", "manifests", target.app_name]
         if self._config.argocd_grpc_web:
@@ -149,24 +195,37 @@ class ArgoCDClient:
                 timeout=60,
             )
             if result.returncode != 0:
+                stderr = result.stderr.strip()
+
+                if self._is_app_not_found_error(stderr):
+                    logger.info(
+                        "ArgoCD app %s not found after re-login - treating as disabled (not an error)",
+                        target.app_name,
+                    )
+                    return DigestResult(DigestStatus.NOT_DEPLOYED)
+
                 logger.error(
                     "Failed to get manifests for %s after re-login: %s",
                     target.app_name,
-                    result.stderr.strip(),
+                    stderr,
                 )
-                return None
+                return DigestResult(DigestStatus.ERROR)
 
             return self._parse_digest(target, result.stdout)
 
         except subprocess.TimeoutExpired:
             logger.error("ArgoCD manifests command timed out for %s", target.app_name)
-            return None
+            return DigestResult(DigestStatus.ERROR)
         except FileNotFoundError:
             logger.error("ArgoCD CLI not found")
-            return None
+            return DigestResult(DigestStatus.ERROR)
 
-    def _parse_digest(self, target: ArgoDeploymentTarget, stdout: str) -> Optional[str]:
-        """Extract image digest from manifest output."""
+    def _parse_digest(self, target: ArgoDeploymentTarget, stdout: str) -> DigestResult:
+        """Extract image digest from manifest output.
+
+        If the app exists but no matching image is present, the workload is
+        considered not deployed (e.g. scaled to zero / disabled) rather than failed.
+        """
         for line in stdout.splitlines():
             stripped = line.strip()
             if "image:" not in stripped:
@@ -184,11 +243,11 @@ class ArgoCDClient:
                     target.image_pattern,
                     digest,
                 )
-                return digest
+                return DigestResult(DigestStatus.FOUND, digest)
 
-        logger.warning(
-            "No digest found in manifests for %s matching pattern '%s'",
-            target.app_name,
+        logger.info(
+            "No image matching pattern '%s' in manifests for %s - treating as not deployed",
             target.image_pattern,
+            target.app_name,
         )
-        return None
+        return DigestResult(DigestStatus.NOT_DEPLOYED)
