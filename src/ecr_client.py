@@ -11,7 +11,7 @@ from typing import Optional
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 
-from src.config import AppConfig, ECRImageTarget
+from src.config import AppConfig, DeploymentTarget
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,7 @@ class ECRClient:
 
         return boto3.client("ecr", **kwargs)
 
-    def get_image_digest(self, target: ECRImageTarget) -> Optional[str]:
+    def get_image_digest(self, target: DeploymentTarget) -> Optional[str]:
         """Fetch the digest for a specific image tag from ECR.
 
         Returns the image digest (sha256:...) or None on failure.
@@ -64,6 +64,14 @@ class ECRClient:
                 reverse=True,
             )[0]
             digest = latest.get("imageDigest")
+
+            if not digest:
+                logger.warning(
+                    "Image found for %s:%s but no digest was returned",
+                    target.repository,
+                    target.tag,
+                )
+                return None
 
             logger.info(
                 "ECR digest for %s:%s -> %s",

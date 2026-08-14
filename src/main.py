@@ -37,8 +37,7 @@ def main() -> None:
     logger.info("Starting digsync with poll interval %ds", config.poll_interval_seconds)
     logger.info(
         "Monitoring %d ECR targets and %d ArgoCD targets",
-        len(config.ecr_targets),
-        len(config.argocd_targets),
+        len(config.targets),
     )
 
     signal.signal(signal.SIGTERM, _handle_signal)

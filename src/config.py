@@ -1,11 +1,19 @@
 """Application configuration loaded entirely from environment variables.
 
 Pattern for multiple targets uses indexed variables:
-  ECR_TARGET_1_NAME, ECR_TARGET_1_REPOSITORY, ECR_TARGET_1_TAG
-  ECR_TARGET_2_NAME, ECR_TARGET_2_REPOSITORY, ECR_TARGET_2_TAG
-  ...
-  ARGOCD_TARGET_1_NAME, ARGOCD_TARGET_1_APP_NAME, ARGOCD_TARGET_1_IMAGE_PATTERN
-  ...
+
+targets:
+  - app_name: 
+    name: 
+    repository: 
+    tag: 
+    image_pattern: 
+    
+  - app_name: 
+    name: 
+    repository: 
+    tag: 
+    image_pattern: 
 
 Auth strategies:
   ECR: IRSA (default on K8s) or explicit AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY
@@ -15,26 +23,22 @@ Auth strategies:
 import os
 import logging
 import sys
+import yaml
+
 from dataclasses import dataclass
 from typing import List, Optional
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class ECRImageTarget:
-    """A single ECR image to monitor."""
+class DeploymentTarget:
+    """A single application deployment to monitor."""
 
     name: str
     repository: str
     tag: str
-
-
-@dataclass(frozen=True)
-class ArgoDeploymentTarget:
-    """A single ArgoCD deployment to monitor."""
-
-    name: str
     app_name: str
     image_pattern: str
 
@@ -56,8 +60,7 @@ class AppConfig:
     argocd_password: Optional[str]
     argocd_grpc_web: bool
 
-    ecr_targets: List[ECRImageTarget]
-    argocd_targets: List[ArgoDeploymentTarget]
+    targets: List[DeploymentTarget]
 
     metrics_port: int
     poll_interval_seconds: int
@@ -73,56 +76,16 @@ def _require_env(key: str) -> str:
     return value
 
 
-def _parse_ecr_targets() -> List[ECRImageTarget]:
-    """Parse indexed ECR target variables.
+def _load_targets_config():
+    config_path = os.getenv(
+        "TARGETS_CONFIG_PATH",
+        Path(__file__).parent / "targets.yaml",
+    )
 
-    Reads ECR_TARGETS_COUNT then iterates:
-      ECR_TARGET_{i}_NAME
-      ECR_TARGET_{i}_REPOSITORY
-      ECR_TARGET_{i}_TAG
-    """
-    count = int(os.environ.get("ECR_TARGETS_COUNT", "0"))
-    if count == 0:
-        logger.error("ECR_TARGETS_COUNT is not set or is 0")
-        sys.exit(1)
+    with open(config_path) as f:
+        return yaml.safe_load(f)
 
-    targets = []
-    for i in range(1, count + 1):
-        prefix = f"ECR_TARGET_{i}"
-        name = _require_env(f"{prefix}_NAME")
-        repository = _require_env(f"{prefix}_REPOSITORY")
-        tag = os.environ.get(f"{prefix}_TAG", "latest")
-
-        targets.append(ECRImageTarget(name=name, repository=repository, tag=tag))
-
-    return targets
-
-
-def _parse_argocd_targets() -> List[ArgoDeploymentTarget]:
-    """Parse indexed ArgoCD target variables.
-
-    Reads ARGOCD_TARGETS_COUNT then iterates:
-      ARGOCD_TARGET_{i}_NAME
-      ARGOCD_TARGET_{i}_APP_NAME
-      ARGOCD_TARGET_{i}_IMAGE_PATTERN
-    """
-    count = int(os.environ.get("ARGOCD_TARGETS_COUNT", "0"))
-    if count == 0:
-        logger.error("ARGOCD_TARGETS_COUNT is not set or is 0")
-        sys.exit(1)
-
-    targets = []
-    for i in range(1, count + 1):
-        prefix = f"ARGOCD_TARGET_{i}"
-        name = _require_env(f"{prefix}_NAME")
-        app_name = _require_env(f"{prefix}_APP_NAME")
-        image_pattern = _require_env(f"{prefix}_IMAGE_PATTERN")
-
-        targets.append(ArgoDeploymentTarget(name=name, app_name=app_name, image_pattern=image_pattern))
-
-    return targets
-
-
+    
 def load_config() -> AppConfig:
     """Load full configuration from environment variables."""
 
@@ -132,6 +95,12 @@ def load_config() -> AppConfig:
     argocd_auth_token = os.environ.get("ARGOCD_AUTH_TOKEN")
     argocd_username = os.environ.get("ARGOCD_USERNAME")
     argocd_password = os.environ.get("ARGOCD_PASSWORD")
+
+    targets_config = _load_targets_config()
+    targets = [
+        DeploymentTarget(**target)
+        for target in targets_config["targets"]
+    ]
 
     if not argocd_auth_token and not (argocd_username and argocd_password):
         logger.error("Either ARGOCD_AUTH_TOKEN or both ARGOCD_USERNAME and ARGOCD_PASSWORD must be set")
@@ -147,8 +116,7 @@ def load_config() -> AppConfig:
         argocd_username=argocd_username,
         argocd_password=argocd_password,
         argocd_grpc_web=os.environ.get("ARGOCD_GRPC_WEB", "true").lower() == "true",
-        ecr_targets=_parse_ecr_targets(),
-        argocd_targets=_parse_argocd_targets(),
+        targets=targets,
         metrics_port=int(os.environ.get("METRICS_PORT", "8000")),
         poll_interval_seconds=int(os.environ.get("POLL_INTERVAL_SECONDS", "60")),
         log_level=os.environ.get("LOG_LEVEL", "INFO").upper(),

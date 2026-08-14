@@ -69,68 +69,95 @@ class _DigestStore:
     """Holds last known digests and deployment state for comparison across sources."""
 
     def __init__(self):
-        self.ecr: dict[str, str] = {}
-        self.argocd: dict[str, str] = {}
-        # Names of services currently disabled / not deployed in ArgoCD.
-        self.argocd_not_deployed: set[str] = set()
+        # key: (repository, tag)
+        self.ecr: dict[tuple[str, str], str] = {}
+
+        # key: (app_name, image_pattern)
+        self.argocd: dict[tuple[str, str], str] = {}
+
+        # key: (app_name, image_pattern)
+        self.argocd_not_deployed: set[tuple[str, str]] = set()
 
 
 _store = _DigestStore()
 
 
 def update_metrics(config: AppConfig, ecr_client: ECRClient, argocd_client: ArgoCDClient) -> None:
-    """Fetch digests from ECR and ArgoCD, update all Prometheus metrics."""
+    """Fetch digests from ECR and ArgoCD and update Prometheus metrics."""
 
-    for target in config.ecr_targets:
+    # ECR is queried once per unique service.
+    #
+    # A service can have multiple ArgoCD targets, but they all use the
+    # same ECR repository/tag.
+    ecr_targets = {}
+
+    for target in config.targets:
+        ecr_key = (target.repository, target.tag)
+        ecr_targets.setdefault(ecr_key, target)
+
+    for target in ecr_targets.values():
+        ecr_key = (target.repository, target.tag)
         digest = ecr_client.get_image_digest(target)
-        if digest:
-            ecr_built_digest.labels(
-                name=target.name,
-                repository=target.repository,
-                tag=target.tag,
-                digest=digest,
-            ).set(1)
-            ecr_scrape_success.labels(
-                name=target.name,
-                repository=target.repository,
-                tag=target.tag,
-            ).set(1)
-            _store.ecr[target.name] = digest
-        else:
-            ecr_scrape_success.labels(
-                name=target.name,
-                repository=target.repository,
-                tag=target.tag,
-            ).set(0)
 
-    for target in config.argocd_targets:
+        if digest:
+            old_digest = _store.ecr.get(ecr_key)
+
+            if old_digest and old_digest != digest:
+                ecr_built_digest.remove(target.name, target.repository, target.tag, old_digest)
+
+            ecr_built_digest.labels(name=target.name, repository=target.repository, tag=target.tag, digest=digest).set(1)
+            ecr_scrape_success.labels(name=target.name, repository=target.repository, tag=target.tag).set(1)
+
+            _store.ecr[ecr_key] = digest
+
+        else:
+            _store.ecr.pop(ecr_key, None)
+
+            ecr_scrape_success.labels(name=target.name, repository=target.repository, tag=target.tag).set(0)
+
+    # Every ArgoCD application is queried separately.
+    #
+    # This is important because one service can have multiple ArgoCD
+    # applications, e.g. sbt-coach-user-profiles.
+    for target in config.targets:
         result = argocd_client.get_running_digest(target)
 
+        app_key = (target.app_name, target.image_pattern)
+
         if result.status == DigestStatus.FOUND:
-            argocd_deployed_digest.labels(
-                name=target.name,
-                app_name=target.app_name,
-                image_pattern=target.image_pattern,
-                digest=result.digest,
-            ).set(1)
-            # A successful scrape that found a deployed workload.
+            old_digest = _store.argocd.get(app_key)
+
+            if old_digest and old_digest != result.digest:
+                argocd_deployed_digest.remove(target.name, target.app_name, target.image_pattern, old_digest)
+
+            argocd_deployed_digest.labels(name=target.name, app_name=target.app_name, image_pattern=target.image_pattern, digest=result.digest).set(1)
             argocd_scrape_success.labels(name=target.name, app_name=target.app_name).set(1)
+
             argocd_deployed.labels(name=target.name, app_name=target.app_name).set(1)
-            _store.argocd[target.name] = result.digest
-            _store.argocd_not_deployed.discard(target.name)
+
+            _store.argocd[app_key] = result.digest
+            _store.argocd_not_deployed.discard(app_key)
 
         elif result.status == DigestStatus.NOT_DEPLOYED:
-            # Service is disabled / not deployed in ArgoCD. This is expected in dev
-            # and is NOT a failure: the scrape itself succeeded, there's just nothing
-            # to compare against.
+            # Service is disabled / not deployed in ArgoCD.
+            # This is expected in dev and is NOT a scrape failure.
+
+            old_digest = _store.argocd.pop(app_key, None)
+
+            if old_digest: 
+                argocd_deployed_digest.remove(target.name, target.app_name, target.image_pattern, old_digest)
+
             argocd_scrape_success.labels(name=target.name, app_name=target.app_name).set(1)
             argocd_deployed.labels(name=target.name, app_name=target.app_name).set(0)
-            _store.argocd.pop(target.name, None)
-            _store.argocd_not_deployed.add(target.name)
 
-        else:  # DigestStatus.ERROR
+            _store.argocd_not_deployed.add(app_key)
+
+        else:
+            # DigestStatus.ERROR
+            _store.argocd.pop(app_key, None)
+            _store.argocd_not_deployed.discard(app_key)
+
             argocd_scrape_success.labels(name=target.name, app_name=target.app_name).set(0)
-            _store.argocd_not_deployed.discard(target.name)
 
     _update_sync_status(config)
 
@@ -138,36 +165,34 @@ def update_metrics(config: AppConfig, ecr_client: ECRClient, argocd_client: Argo
 
 
 def _update_sync_status(config: AppConfig) -> None:
-    """Compare ECR and ArgoCD digests by matching target names.
+    """Compare ECR and ArgoCD digests for every deployment target.
 
     Drift (value 0) is only reported when BOTH digests are present and differ.
-    A service that is disabled / not deployed in ArgoCD is reported as 2 (not an
-    error) so that toggling services in dev never produces false mismatch alerts.
+
+    A service that is disabled / not deployed in ArgoCD is reported as 2
+    (not an error), so toggling services in dev never produces false
+    mismatch alerts.
     """
 
-    ecr_by_name = {t.name: t for t in config.ecr_targets}
-    argocd_by_name = {t.name: t for t in config.argocd_targets}
+    for target in config.targets:
+        ecr_digest = _store.ecr.get((target.repository, target.tag))
+        app_key = (target.app_name, target.image_pattern)
 
-    all_names = set(ecr_by_name.keys()) & set(argocd_by_name.keys())
+        argocd_digest = _store.argocd.get(app_key)
 
-    for name in all_names:
-        ecr_target = ecr_by_name[name]
-        argocd_target = argocd_by_name[name]
-
-        ecr_dig = _store.ecr.get(name)
-        argo_dig = _store.argocd.get(name)
-
-        if name in _store.argocd_not_deployed:
+        if app_key in _store.argocd_not_deployed:
             # Disabled in ArgoCD - explicitly NOT a mismatch.
             value = 2.0
-        elif ecr_dig and argo_dig:
-            value = 1.0 if ecr_dig == argo_dig else 0.0
+
+        elif ecr_digest and argocd_digest:
+            value = 1.0 if ecr_digest == argocd_digest else 0.0
+
         else:
-            # ECR (or ArgoCD) data missing due to a real scrape problem.
+            # ECR or ArgoCD data is missing due to a real scrape problem.
             value = -1.0
 
         digest_in_sync.labels(
-            name=name,
-            repository=ecr_target.repository,
-            app_name=argocd_target.app_name,
+            name=target.name,
+            repository=target.repository,
+            app_name=target.app_name,
         ).set(value)
