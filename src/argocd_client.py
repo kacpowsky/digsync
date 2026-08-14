@@ -294,7 +294,9 @@ class ArgoCDClient:
                 )
                 continue
 
-            digest = match.group(0)
+            # group(1) is the bare "sha256:<hash>" without the leading "@",
+            # matching the format ECR returns so digest comparison works.
+            digest = match.group(1)
 
             logger.info(
                 "ArgoCD running digest for %s [%s] -> %s",
