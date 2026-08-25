@@ -6,7 +6,7 @@ Supports two auth strategies:
 """
 
 import logging
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -14,6 +14,16 @@ from botocore.exceptions import ClientError, NoCredentialsError
 from src.config import AppConfig, DeploymentTarget
 
 logger = logging.getLogger(__name__)
+
+
+class ImageInfo(NamedTuple):
+    """Digest and push date of the latest ECR image for a tag."""
+
+    digest: str
+    # ISO 8601 timestamp of when the image was pushed to ECR (imagePushedAt),
+    # or "" if ECR did not return it. Exposed as a Prometheus label so a
+    # Grafana dashboard can show how old the built image is.
+    pushed_at: str
 
 
 class ECRClient:
@@ -37,10 +47,10 @@ class ECRClient:
 
         return boto3.client("ecr", **kwargs)
 
-    def get_image_digest(self, target: DeploymentTarget) -> Optional[str]:
-        """Fetch the digest for a specific image tag from ECR.
+    def get_image_digest(self, target: DeploymentTarget) -> Optional[ImageInfo]:
+        """Fetch the digest and push date for a specific image tag from ECR.
 
-        Returns the image digest (sha256:...) or None on failure.
+        Returns an ImageInfo (digest + pushed_at) or None on failure.
         """
         try:
             response = self._client.describe_images(
@@ -73,13 +83,17 @@ class ECRClient:
                 )
                 return None
 
+            pushed_at_raw = latest.get("imagePushedAt")
+            pushed_at = pushed_at_raw.isoformat() if pushed_at_raw else ""
+
             logger.info(
-                "ECR digest for %s:%s -> %s",
+                "ECR digest for %s:%s -> %s (pushed_at=%s)",
                 target.repository,
                 target.tag,
                 digest,
+                pushed_at or "unknown",
             )
-            return digest
+            return ImageInfo(digest=digest, pushed_at=pushed_at)
 
         except (ClientError, NoCredentialsError) as exc:
             logger.error(

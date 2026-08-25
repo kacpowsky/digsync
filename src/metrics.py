@@ -16,11 +16,13 @@ from src.argocd_client import ArgoCDClient, DigestStatus
 
 logger = logging.getLogger(__name__)
 
-# Raw digest exposed as a label value - queryable in Grafana
+# Raw digest exposed as a label value - queryable in Grafana.
+# The 'pushed_at' label carries the ISO 8601 date the image was pushed to ECR,
+# so a dashboard can show how old the built image is.
 ecr_built_digest = Gauge(
     "digsync_ecr_built_digest_hash",
     "Constant 1 gauge; the 'digest' label holds the latest ECR image digest (built)",
-    ["name", "repository", "tag", "digest"],
+    ["name", "repository", "tag", "digest", "pushed_at"],
 )
 
 argocd_deployed_digest = Gauge(
@@ -69,8 +71,8 @@ class _DigestStore:
     """Holds last known digests and deployment state for comparison across sources."""
 
     def __init__(self):
-        # key: (repository, tag)
-        self.ecr: dict[tuple[str, str], str] = {}
+        # key: (repository, tag) -> value: (digest, pushed_at)
+        self.ecr: dict[tuple[str, str], tuple[str, str]] = {}
 
         # key: (app_name, image_pattern)
         self.argocd: dict[tuple[str, str], str] = {}
@@ -97,18 +99,28 @@ def update_metrics(config: AppConfig, ecr_client: ECRClient, argocd_client: Argo
 
     for target in ecr_targets.values():
         ecr_key = (target.repository, target.tag)
-        digest = ecr_client.get_image_digest(target)
+        image = ecr_client.get_image_digest(target)
 
-        if digest:
-            old_digest = _store.ecr.get(ecr_key)
+        if image:
+            digest = image.digest
+            pushed_at = image.pushed_at
 
-            if old_digest and old_digest != digest:
-                ecr_built_digest.remove(target.name, target.repository, target.tag, old_digest)
+            old = _store.ecr.get(ecr_key)
 
-            ecr_built_digest.labels(name=target.name, repository=target.repository, tag=target.tag, digest=digest).set(1)
+            if old and old != (digest, pushed_at):
+                old_digest, old_pushed_at = old
+                ecr_built_digest.remove(target.name, target.repository, target.tag, old_digest, old_pushed_at)
+
+            ecr_built_digest.labels(
+                name=target.name,
+                repository=target.repository,
+                tag=target.tag,
+                digest=digest,
+                pushed_at=pushed_at,
+            ).set(1)
             ecr_scrape_success.labels(name=target.name, repository=target.repository, tag=target.tag).set(1)
 
-            _store.ecr[ecr_key] = digest
+            _store.ecr[ecr_key] = (digest, pushed_at)
 
         else:
             _store.ecr.pop(ecr_key, None)
@@ -175,7 +187,8 @@ def _update_sync_status(config: AppConfig) -> None:
     """
 
     for target in config.targets:
-        ecr_digest = _store.ecr.get((target.repository, target.tag))
+        ecr_entry = _store.ecr.get((target.repository, target.tag))
+        ecr_digest = ecr_entry[0] if ecr_entry else None
         app_key = (target.app_name, target.image_pattern)
 
         argocd_digest = _store.argocd.get(app_key)
